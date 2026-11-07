@@ -34,8 +34,8 @@ func (s *Server) hasEphemeralPushed(deviceID string) bool {
 
 // rotationSlot is the position of an app in a device's normal rotation.
 // It is sent to HTTP devices so they can cache images in rotation order.
-// Count is the length of the rotation list, including apps that are
-// currently disabled or scheduled out.
+// Count is the number of positions currently in the rotation (disabled,
+// scheduled-out and empty apps excluded), Index the position among them.
 type rotationSlot struct {
 	Index int
 	Count int
@@ -471,34 +471,10 @@ func (s *Server) determineNextApp(ctx context.Context, device *data.Device, user
 
 		candidate := expanded[nextIndex]
 
-		isInterstitialPos := device.InterstitialEnabled && nextIndex%2 == 1
-
-		shouldDisplay := false
-		if isInterstitialPos {
-			shouldDisplay = true
-			// Interstitial Logic: Skip if previous regular app (at index-1) is skipped
-			// Note: expanded list is always [App, Interstitial, App, Interstitial...]
-			// So an interstitial at index i corresponds to App at i-1.
-			if nextIndex > 0 {
-				prevApp := expanded[nextIndex-1]
-				prevActive := prevApp.Enabled && IsAppScheduleActive(prevApp, device)
-				if !prevActive {
-					shouldDisplay = false
-				}
-			}
-		} else if candidate.Enabled && IsAppScheduleActive(candidate, device) {
-			shouldDisplay = true
-		}
-
-		if device.InterstitialApp != nil && *device.InterstitialApp == candidate.Iname && !isInterstitialPos {
-			if !candidate.Enabled {
-				shouldDisplay = false
-			}
-		}
-
-		if shouldDisplay {
+		if shouldDisplayAt(device, expanded, nextIndex) {
 			if s.possiblyRender(ctx, candidate, device, user) && !candidate.EmptyLastRender {
-				s.setRotationSlot(device.ID, &rotationSlot{Index: nextIndex, Count: len(expanded)})
+				slot := activeRotationSlot(device, expanded, nextIndex)
+				s.setRotationSlot(device.ID, &slot)
 				return candidate, nextIndex, nil
 			}
 			// Stop trying more apps if context was canceled (e.g., request timed out)
@@ -512,6 +488,57 @@ func (s *Server) determineNextApp(ctx context.Context, device *data.Device, user
 	}
 
 	return nil, 0, nil
+}
+
+// shouldDisplayAt reports whether the app at position i of the expanded list
+// is eligible for the rotation (enabled, schedule active, interstitial
+// rules). It does not render and ignores EmptyLastRender.
+func shouldDisplayAt(device *data.Device, expanded []*data.App, i int) bool {
+	candidate := expanded[i]
+	isInterstitialPos := device.InterstitialEnabled && i%2 == 1
+
+	shouldDisplay := false
+	if isInterstitialPos {
+		shouldDisplay = true
+		// Interstitial Logic: Skip if previous regular app (at index-1) is skipped
+		// Note: expanded list is always [App, Interstitial, App, Interstitial...]
+		// So an interstitial at index i corresponds to App at i-1.
+		if i > 0 {
+			prevApp := expanded[i-1]
+			prevActive := prevApp.Enabled && IsAppScheduleActive(prevApp, device)
+			if !prevActive {
+				shouldDisplay = false
+			}
+		}
+	} else if candidate.Enabled && IsAppScheduleActive(candidate, device) {
+		shouldDisplay = true
+	}
+
+	if device.InterstitialApp != nil && *device.InterstitialApp == candidate.Iname && !isInterstitialPos {
+		if !candidate.Enabled {
+			shouldDisplay = false
+		}
+	}
+	return shouldDisplay
+}
+
+// activeRotationSlot returns the position of expanded[index] among the
+// positions that currently take part in the rotation (eligible and with a
+// non-empty last render), and how many there are. The app at index is the
+// one just chosen, so it always counts as active.
+func activeRotationSlot(device *data.Device, expanded []*data.App, index int) rotationSlot {
+	slot := rotationSlot{}
+	for i, app := range expanded {
+		active := i == index || (shouldDisplayAt(device, expanded, i) && !app.EmptyLastRender)
+		if !active {
+			continue
+		}
+		if i < index {
+			slot.Index++
+		}
+		slot.Count++
+	}
+	return slot
 }
 
 func createExpandedAppsList(device *data.Device, apps []*data.App) []*data.App {
