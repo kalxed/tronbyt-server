@@ -137,6 +137,17 @@ func (s *Server) handleNextApp(w http.ResponseWriter, r *http.Request) {
 			displaying = app.Iname
 		}
 
+		// Firmware that knows what is on screen (e.g. while it shows cached
+		// images during a slow download) reports it; prefer that to the guess.
+		if reported := r.Header.Get("Tronbyt-Displaying"); reported != "" {
+			for _, a := range device.Apps {
+				if a.Iname == reported {
+					displaying = reported
+					break
+				}
+			}
+		}
+
 		if _, err := gorm.G[data.Device](s.DB).Where("id = ?", device.ID).Update(r.Context(), "displaying_app", displaying); err != nil {
 			slog.Error("Failed to update displaying_app for HTTP device", "device", device.ID, "error", err)
 		}
