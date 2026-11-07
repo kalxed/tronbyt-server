@@ -120,10 +120,23 @@ func (s *Server) handleNextApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For HTTP devices, we assume "Sent" equals "Displaying" (or roughly so).
-	// We update DisplayingApp here so the Preview uses the explicit field instead of fallback.
+	// HTTP firmware requests the next image as soon as it starts showing the
+	// one from its previous request, so the device is now displaying the app
+	// we sent last time, not the one we are about to send. Without a previous
+	// send (e.g. after a server restart), fall back to the app being sent.
 	if app != nil {
-		if _, err := gorm.G[data.Device](s.DB).Where("id = ?", device.ID).Update(r.Context(), "displaying_app", app.Iname); err != nil {
+		s.httpLastSentMu.Lock()
+		if s.httpLastSentApp == nil {
+			s.httpLastSentApp = make(map[string]string)
+		}
+		displaying, hadPrevious := s.httpLastSentApp[device.ID]
+		s.httpLastSentApp[device.ID] = app.Iname
+		s.httpLastSentMu.Unlock()
+		if !hadPrevious {
+			displaying = app.Iname
+		}
+
+		if _, err := gorm.G[data.Device](s.DB).Where("id = ?", device.ID).Update(r.Context(), "displaying_app", displaying); err != nil {
 			slog.Error("Failed to update displaying_app for HTTP device", "device", device.ID, "error", err)
 		}
 	}
