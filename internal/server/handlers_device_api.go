@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"time"
 
 	"tronbyt-server/internal/data"
 
@@ -139,14 +141,36 @@ func (s *Server) handleNextApp(w http.ResponseWriter, r *http.Request) {
 
 		// Firmware that knows what is on screen (e.g. while it shows cached
 		// images during a slow download) reports it; prefer that to the guess.
+		fromReport := false
 		if reported := r.Header.Get("Tronbyt-Displaying"); reported != "" {
 			for _, a := range device.Apps {
 				if a.Iname == reported {
 					displaying = reported
+					fromReport = true
 					break
 				}
 			}
 		}
+
+		// Remember where and since when, so "Now Showing" can follow a device
+		// that keeps rotating from its image cache between requests.
+		anchor := httpDisplayAnchor{Iname: displaying, Index: -1, At: time.Now()}
+		if fromReport {
+			if idx, err := strconv.Atoi(r.Header.Get("Tronbyt-Displaying-Index")); err == nil {
+				anchor.Index = idx
+			}
+			if since, err := strconv.ParseInt(r.Header.Get("Tronbyt-Displaying-Since"), 10, 64); err == nil &&
+				plausibleDisplayStart(time.UnixMilli(since), anchor.At) {
+				// Absolute start from the device's synced clock: exact, however
+				// long the request took to arrive.
+				anchor.At = time.UnixMilli(since)
+			} else if ms, err := strconv.Atoi(r.Header.Get("Tronbyt-Displaying-Ms")); err == nil && ms > 0 {
+				anchor.At = anchor.At.Add(-time.Duration(ms) * time.Millisecond)
+			}
+			anchor.Caches = r.Header.Get("Tronbyt-Image-Cache") == "1"
+		}
+		s.setHTTPDisplayAnchor(device.ID, anchor)
+		s.scheduleDisplayUpdate(device.ID, user.Username)
 
 		if _, err := gorm.G[data.Device](s.DB).Where("id = ?", device.ID).Update(r.Context(), "displaying_app", displaying); err != nil {
 			slog.Error("Failed to update displaying_app for HTTP device", "device", device.ID, "error", err)

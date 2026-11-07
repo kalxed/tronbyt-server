@@ -66,6 +66,123 @@ func (s *Server) takeRotationSlot(deviceID string) (rotationSlot, bool) {
 	return slot, ok
 }
 
+// httpDisplayAnchor is the app an HTTP device last reported on screen.
+type httpDisplayAnchor struct {
+	Iname  string
+	Index  int       // position among the active apps, -1 if unknown
+	At     time.Time // when it appeared on screen
+	Caches bool      // the device keeps rotating from its image cache
+}
+
+func (s *Server) setHTTPDisplayAnchor(deviceID string, a httpDisplayAnchor) {
+	s.httpDisplayMu.Lock()
+	defer s.httpDisplayMu.Unlock()
+	if s.httpDisplay == nil {
+		s.httpDisplay = make(map[string]httpDisplayAnchor)
+	}
+	s.httpDisplay[deviceID] = a
+}
+
+// maxDisplayPrediction bounds how long "Now Showing" keeps advancing without
+// hearing from the device, which may have been switched off.
+const maxDisplayPrediction = 10 * time.Minute
+
+// plausibleDisplayStart reports whether a start time sent by a device is
+// usable: not in the future and within the prediction window (a device clock
+// that is not synced yet sends nonsense).
+func plausibleDisplayStart(start, now time.Time) bool {
+	return !start.After(now.Add(2*time.Second)) && now.Sub(start) <= maxDisplayPrediction
+}
+
+// predictDisplay returns the app a caching HTTP device shows now and how long
+// until it changes. Starting at the app it last reported, it walks the active
+// rotation with each app's dwell time, as the device does while it plays its
+// image cache.
+func (s *Server) predictDisplay(device *data.Device) (string, time.Duration, bool) {
+	s.httpDisplayMu.Lock()
+	a, ok := s.httpDisplay[device.ID]
+	s.httpDisplayMu.Unlock()
+	if !ok || !a.Caches {
+		return "", 0, false
+	}
+	elapsed := time.Since(a.At)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	if elapsed > maxDisplayPrediction {
+		return "", 0, false
+	}
+
+	apps := slices.Clone(device.Apps)
+	sort.Slice(apps, func(i, j int) bool {
+		return apps[i].Order < apps[j].Order
+	})
+	expanded := createExpandedAppsList(device, apps)
+	var active []*data.App
+	for i, app := range expanded {
+		if shouldDisplayAt(device, expanded, i) && !app.EmptyLastRender {
+			active = append(active, app)
+		}
+	}
+
+	pos := -1
+	if a.Index >= 0 && a.Index < len(active) && active[a.Index].Iname == a.Iname {
+		pos = a.Index
+	} else {
+		for i, app := range active {
+			if app.Iname == a.Iname {
+				pos = i
+				break
+			}
+		}
+	}
+	if pos < 0 {
+		return "", 0, false
+	}
+
+	for {
+		dwell := time.Duration(max(1, device.GetEffectiveDwellTime(active[pos]))) * time.Second
+		if elapsed < dwell {
+			return active[pos].Iname, dwell - elapsed, true
+		}
+		elapsed -= dwell
+		pos = (pos + 1) % len(active)
+	}
+}
+
+// scheduleDisplayUpdate tells the dashboard when a caching HTTP device moves
+// on to its next app, since no request marks that moment. Each call replaces
+// the device's pending timer; the timer reschedules itself until prediction
+// stops (no cache, or no report for maxDisplayPrediction).
+func (s *Server) scheduleDisplayUpdate(deviceID, username string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	device, err := gorm.G[data.Device](s.DB).Preload("Apps", nil).Where("id = ?", deviceID).First(ctx)
+	cancel()
+	var next time.Duration
+	ok := false
+	if err == nil {
+		_, next, ok = s.predictDisplay(&device)
+	}
+
+	s.httpDisplayMu.Lock()
+	defer s.httpDisplayMu.Unlock()
+	if s.httpDisplayTimers == nil {
+		s.httpDisplayTimers = make(map[string]*time.Timer)
+	}
+	if t := s.httpDisplayTimers[deviceID]; t != nil {
+		t.Stop()
+		delete(s.httpDisplayTimers, deviceID)
+	}
+	if !ok {
+		return
+	}
+	// A little after the change, so the dashboard's fetch sees the new app.
+	s.httpDisplayTimers[deviceID] = time.AfterFunc(next+50*time.Millisecond, func() {
+		s.notifyDashboard(username, WSEvent{Type: "image_updated", DeviceID: deviceID})
+		s.scheduleDisplayUpdate(deviceID, username)
+	})
+}
+
 // GetNextAppImageHTTP picks what a device should display next, with support for
 // multi-chunk animations (serving sequential chunks across repeated /next calls
 // with custom dwell times).
@@ -332,9 +449,15 @@ func (s *Server) GetCurrentAppImage(ctx context.Context, device *data.Device) ([
 		}
 	}
 
+	displayingApp := device.DisplayingApp
+	// Caching HTTP devices keep rotating between requests: follow along.
+	if predicted, _, ok := s.predictDisplay(device); ok {
+		displayingApp = &predicted
+	}
+
 	// Priority 1: Check DisplayingApp (Real-time confirmation from WS devices)
-	if device.DisplayingApp != nil && *device.DisplayingApp != "" {
-		targetIname := *device.DisplayingApp
+	if displayingApp != nil && *displayingApp != "" {
+		targetIname := *displayingApp
 		// slog.Debug("Checking DisplayingApp", "iname", targetIname)
 		// Find app in device.Apps
 		for i := range device.Apps {

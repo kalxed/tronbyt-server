@@ -85,6 +85,9 @@ type Server struct {
 	httpLastSentMu        sync.Mutex
 	rotationSlots         map[string]rotationSlot
 	rotationSlotsMu       sync.Mutex
+	httpDisplay           map[string]httpDisplayAnchor
+	httpDisplayMu         sync.Mutex
+	httpDisplayTimers     map[string]*time.Timer
 	inFlightRenders       map[string]chan struct{}
 	renderPending         map[string]bool
 	inFlightRendersMu     sync.Mutex
@@ -155,6 +158,7 @@ func NewServer(db *gorm.DB, cfg *config.Settings) *Server {
 		deviceCurrentChunkApp: make(map[string]string),
 		httpLastSentApp:       make(map[string]string),
 		rotationSlots:         make(map[string]rotationSlot),
+		httpDisplay:           make(map[string]httpDisplayAnchor),
 		inFlightRenders:       make(map[string]chan struct{}),
 		renderPending:         make(map[string]bool),
 	}
