@@ -113,6 +113,7 @@ func (s *Server) handleNextApp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	imgData, app, dwell, err := s.GetNextAppImageHTTP(r.Context(), device, user, s.GetBaseURL(r))
+	slot, hasSlot := s.takeRotationSlot(device.ID)
 	if err != nil {
 		// Send default image if error (or not found)
 		slog.Error("Failed to get next app image", "device", device.ID, "error", err)
@@ -152,6 +153,15 @@ func (s *Server) handleNextApp(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Tronbyt-Brightness", fmt.Sprintf("%d", brightness))
 
 	w.Header().Set("Tronbyt-Dwell-Secs", fmt.Sprintf("%d", dwell))
+
+	// Rotation position, so devices can cache images in rotation order.
+	// Animations split into several chunks are left out: their chunks would
+	// share one position.
+	if app != nil && hasSlot && len(s.getAppChunks(device.ID, app)) <= 1 {
+		w.Header().Set("Tronbyt-App-Id", app.Iname)
+		w.Header().Set("Tronbyt-App-Index", fmt.Sprintf("%d", slot.Index))
+		w.Header().Set("Tronbyt-App-Count", fmt.Sprintf("%d", slot.Count))
+	}
 
 	if _, err := w.Write(imgData); err != nil {
 		slog.Error("Failed to write image data to response", "error", err)

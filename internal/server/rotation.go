@@ -32,6 +32,40 @@ func (s *Server) hasEphemeralPushed(deviceID string) bool {
 	return false
 }
 
+// rotationSlot is the position of an app in a device's normal rotation.
+// It is sent to HTTP devices so they can cache images in rotation order.
+// Count is the length of the rotation list, including apps that are
+// currently disabled or scheduled out.
+type rotationSlot struct {
+	Index int
+	Count int
+}
+
+// setRotationSlot records where the image just chosen for a device sits in
+// its rotation. A nil slot means the image is not part of the normal
+// rotation (pushed image, pinned or night mode app, default image).
+func (s *Server) setRotationSlot(deviceID string, slot *rotationSlot) {
+	s.rotationSlotsMu.Lock()
+	defer s.rotationSlotsMu.Unlock()
+	if s.rotationSlots == nil {
+		s.rotationSlots = make(map[string]rotationSlot)
+	}
+	if slot == nil {
+		delete(s.rotationSlots, deviceID)
+		return
+	}
+	s.rotationSlots[deviceID] = *slot
+}
+
+// takeRotationSlot returns and clears the slot recorded by setRotationSlot.
+func (s *Server) takeRotationSlot(deviceID string) (rotationSlot, bool) {
+	s.rotationSlotsMu.Lock()
+	defer s.rotationSlotsMu.Unlock()
+	slot, ok := s.rotationSlots[deviceID]
+	delete(s.rotationSlots, deviceID)
+	return slot, ok
+}
+
 // GetNextAppImageHTTP picks what a device should display next, with support for
 // multi-chunk animations (serving sequential chunks across repeated /next calls
 // with custom dwell times).
@@ -134,6 +168,9 @@ func (s *Server) GetNextAppImageHTTP(ctx context.Context, device *data.Device, u
 // used to draw a setup screen when the device has no apps, and may be empty
 // when no request context is available (the placeholder is used instead).
 func (s *Server) GetNextAppImage(ctx context.Context, device *data.Device, user *data.User, baseURL string) ([]byte, *data.App, error) {
+	// Only the normal rotation below records a slot.
+	s.setRotationSlot(device.ID, nil)
+
 	// 1. Check Pushed Ephemeral Images (__*)
 	// Serve the oldest and delete only that one. Anonymous pushes accumulate
 	// unbounded; callers should use coalesceID to limit queue depth.
@@ -461,6 +498,7 @@ func (s *Server) determineNextApp(ctx context.Context, device *data.Device, user
 
 		if shouldDisplay {
 			if s.possiblyRender(ctx, candidate, device, user) && !candidate.EmptyLastRender {
+				s.setRotationSlot(device.ID, &rotationSlot{Index: nextIndex, Count: len(expanded)})
 				return candidate, nextIndex, nil
 			}
 			// Stop trying more apps if context was canceled (e.g., request timed out)
